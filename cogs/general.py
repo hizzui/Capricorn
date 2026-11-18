@@ -204,6 +204,17 @@ class General(commands.Cog):
             ),
             inline=False,
         )
+        embed.add_field(
+            name="Public APIs",
+            value=(
+                f"`{p}anime <title>` — Search anime info via MyAnimeList (Jikan API)\n"
+                f"`{p}crypto [coin]` — Live crypto prices in USD & BRL (CoinGecko API)\n"
+                f"`{p}weather <city>` — Real-time weather forecast (Open-Meteo API)\n"
+                f"`{p}github <username>` — Inspect a GitHub profile (GitHub REST API)\n"
+                f"`{p}define <word>` — English dictionary lookup (Free Dictionary API)"
+            ),
+            inline=False,
+        )
         await ctx.send(embed=embed)
 
 
