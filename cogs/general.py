@@ -1,103 +1,182 @@
 """
-General utility commands (`!ping`, `!oi`, `!echo`) and the custom `!ajuda` (`!help`) embed.
+General commands, server/member profile info, quick chat tools, and help menu.
 """
 
 from __future__ import annotations
 
-import logging
+import random
+from typing import Optional
 
 import discord
 from discord.ext import commands
 
-logger = logging.getLogger("ndb.general")
-
 
 class General(commands.Cog):
-    """Core bot diagnostics and command reference menu."""
+    """General utilities, server/member inspection, and help menu."""
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
 
-    @commands.command(name="ping", brief="Display gateway latency")
+    @commands.command()
     async def ping(self, ctx: commands.Context) -> None:
-        """Return current WebSocket gateway latency in milliseconds."""
-        latency_ms = round(self.bot.latency * 1000)
-        await ctx.send(f"🏓 Pong! Latência: **{latency_ms}ms**")
+        """Check current gateway latency."""
+        ms = round(self.bot.latency * 1000)
+        await ctx.send(f"🏓 Pong! Latência: **{ms}ms**")
 
-    @commands.command(name="oi", brief="Greet the user")
-    async def oi(self, ctx: commands.Context) -> None:
-        """Send a quick greeting mentioning the caller."""
-        await ctx.send(f"Olá, {ctx.author.mention}! 👋")
+    @commands.command()
+    async def dado(self, ctx: commands.Context, lados: int = 6) -> None:
+        """Roll an N-sided die (default: 6)."""
+        if not 2 <= lados <= 1000:
+            await ctx.send("❌ Escolha entre 2 e 1000 lados.")
+            return
+        await ctx.send(f"🎲 Resultado (d{lados}): **{random.randint(1, lados)}**")
 
-    @commands.command(name="echo", brief="Repeat a text message")
-    async def echo(self, ctx: commands.Context, *, texto: str) -> None:
-        """Echo back the provided message string with mass mentions escaped."""
-        safe_text = discord.utils.escape_mentions(texto)
-        await ctx.send(safe_text)
+    @commands.command()
+    async def moeda(self, ctx: commands.Context) -> None:
+        """Flip a coin."""
+        lado = "Cara" if random.random() >= 0.5 else "Coroa"
+        await ctx.send(f"🪙 **{lado}!**")
 
-    @commands.command(
-        name="ajuda",
-        aliases=["help", "comandos"],
-        brief="Display the categorized command overview",
-    )
-    async def ajuda(self, ctx: commands.Context) -> None:
-        """Render the categorized embed of all bot commands."""
+    @commands.command()
+    async def vote(self, ctx: commands.Context, *, pergunta: str) -> None:
+        """Create a quick thumbs-up / thumbs-down poll."""
         embed = discord.Embed(
-            title="📚 Central de Comandos — NDB Bot",
-            description="Lista de comandos agrupados por módulo. O prefixo padrão é `!`.",
+            title="📊 Votação",
+            description=pergunta,
             color=discord.Color.blue(),
         )
+        embed.set_footer(text=f"Criada por {ctx.author.display_name}")
+        msg = await ctx.send(embed=embed)
+        await msg.add_reaction("👍")
+        await msg.add_reaction("👎")
 
-        sections = [
-            (
-                "🔧 Gerais",
-                "`!ping` · `!oi` · `!echo <texto>` · `!ajuda`",
-            ),
-            (
-                "🎲 Diversão & Utilidades",
-                "`!dado [lados]` · `!moeda` · `!vote <pergunta>` · `!calc <expressão>`",
-            ),
-            (
-                "💰 Economia",
-                "`!balance [@user]` · `!pay <@user> <valor>` · `!slots [aposta]` · `!payday` · `!leaderboard`",
-            ),
-            (
-                "ℹ️ Informações",
-                "`!user [@user]` · `!servidor` · `!avatar [@user]`",
-            ),
-            (
-                "🔨 Moderação",
-                "`!kick <@user> [razão]` · `!ban <@user> [razão]` · `!unban <id|nome>`\n"
-                "`!mute <@user>` · `!unmute <@user>` · `!warn <@user> [razão]` · `!warnings [@user]` · `!unwarn <@user>`",
-            ),
-            (
-                "🧹 Limpeza de Canal",
-                "`!purge [qtd] [@user]` · `!clean [qtd]` · `!cleanup` · `!clear [qtd]`",
-            ),
-            (
-                "🎯 Trivia",
-                "`!trivia` · `!trivia_score [@user]` · `!trivia_top`",
-            ),
-            (
-                "📺 Monitoramento Twitch",
-                "`!streamset channel <#canal>` · `!streamset show` · `!streamset credentials`\n"
-                "`!stream add twitch <canal>` · `!stream remove <canal>` · `!stream list` · `!stream check <canal>`",
-            ),
-            (
-                "⚙️ Comandos Personalizados",
-                "`!customcom create <nome> <resposta>` · `!customcom list` · `!customcom show <nome>` · `!customcom delete <nome>`",
-            ),
-        ]
+    @commands.command()
+    async def user(
+        self,
+        ctx: commands.Context,
+        member: Optional[discord.Member] = None,
+    ) -> None:
+        """Show profile details and roles for a server member."""
+        target = member or ctx.author
+        embed = discord.Embed(
+            title=f"Perfil de {target.display_name}",
+            color=discord.Color.green(),
+        )
+        embed.set_thumbnail(url=target.display_avatar.url)
+        embed.add_field(name="ID", value=f"`{target.id}`", inline=True)
+        embed.add_field(name="Usuário", value=f"`@{target.name}`", inline=True)
+        embed.add_field(
+            name="Conta criada",
+            value=target.created_at.strftime("%d/%m/%Y"),
+            inline=True,
+        )
 
-        for title, body in sections:
-            embed.add_field(name=title, value=body, inline=False)
+        if isinstance(target, discord.Member) and target.joined_at:
+            embed.add_field(
+                name="Entrou no servidor",
+                value=target.joined_at.strftime("%d/%m/%Y"),
+                inline=True,
+            )
+            roles = [r.mention for r in target.roles if r != ctx.guild.default_role]
+            embed.add_field(
+                name=f"Cargos ({len(roles)})",
+                value=", ".join(roles[:12]) if roles else "Nenhum cargo",
+                inline=False,
+            )
 
-        requester_avatar = ctx.author.display_avatar.url if ctx.author.display_avatar else None
-        embed.set_footer(text=f"Solicitado por {ctx.author}", icon_url=requester_avatar)
+        await ctx.send(embed=embed)
 
-        if self.bot.user and self.bot.user.display_avatar:
-            embed.set_thumbnail(url=self.bot.user.display_avatar.url)
+    @commands.command()
+    async def servidor(self, ctx: commands.Context) -> None:
+        """Show summary stats for the current Discord server."""
+        guild = ctx.guild
+        if guild is None:
+            return
 
+        embed = discord.Embed(
+            title=guild.name,
+            color=discord.Color.purple(),
+        )
+        if guild.icon:
+            embed.set_thumbnail(url=guild.icon.url)
+
+        embed.add_field(name="ID", value=f"`{guild.id}`", inline=True)
+        embed.add_field(
+            name="Dono",
+            value=guild.owner.mention if guild.owner else "N/A",
+            inline=True,
+        )
+        embed.add_field(
+            name="Criado em",
+            value=guild.created_at.strftime("%d/%m/%Y"),
+            inline=True,
+        )
+        embed.add_field(name="Membros", value=str(guild.member_count), inline=True)
+        embed.add_field(
+            name="Canais (Texto / Voz)",
+            value=f"{len(guild.text_channels)} / {len(guild.voice_channels)}",
+            inline=True,
+        )
+        embed.add_field(name="Cargos", value=str(len(guild.roles)), inline=True)
+        await ctx.send(embed=embed)
+
+    @commands.command()
+    async def avatar(
+        self,
+        ctx: commands.Context,
+        member: Optional[discord.Member] = None,
+    ) -> None:
+        """Display a member's full-size avatar."""
+        target = member or ctx.author
+        embed = discord.Embed(
+            title=f"Avatar de {target.display_name}",
+            color=discord.Color.blue(),
+        )
+        embed.set_image(url=target.display_avatar.url)
+        await ctx.send(embed=embed)
+
+    @commands.command(name="ajuda", aliases=["help", "comandos"])
+    async def ajuda(self, ctx: commands.Context) -> None:
+        """List all available bot commands grouped by category."""
+        embed = discord.Embed(
+            title="📚 Comandos — NDB Bot",
+            description="Lista de comandos disponíveis (prefixo padrão `!`):",
+            color=discord.Color.blue(),
+        )
+        embed.add_field(
+            name="🔧 Geral & Servidor",
+            value=(
+                "`!ping` — Latência do bot\n"
+                "`!user [@membro]` — Informações de perfil\n"
+                "`!servidor` — Estatísticas do servidor\n"
+                "`!avatar [@membro]` — Avatar ampliado\n"
+                "`!dado [lados]` · `!moeda` · `!vote <pergunta>`"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="💰 Economia",
+            value=(
+                "`!balance [@membro]` — Consulta saldo\n"
+                "`!payday` — Resgata créditos diários (24h)\n"
+                "`!pay <@membro> <valor>` — Transfere créditos\n"
+                "`!slots [aposta]` — Joga no caça-níqueis\n"
+                "`!leaderboard` — Ranking dos maiores saldos"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="🔨 Moderação",
+            value=(
+                "`!kick <@membro> [razão]` — Expulsa membro\n"
+                "`!ban <@membro> [razão]` — Bane membro\n"
+                "`!unban <id|nome>` — Remove banimento\n"
+                "`!mute <@membro>` / `!unmute <@membro>` — Silencia membro\n"
+                "`!warn <@membro> [razão]` · `!warnings [@membro]` · `!unwarn <@membro>`\n"
+                "`!clear [quantidade]` (`!purge`) — Limpa mensagens do canal"
+            ),
+            inline=False,
+        )
         await ctx.send(embed=embed)
 
 
