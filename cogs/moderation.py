@@ -1,243 +1,287 @@
+"""
+Server moderation cog (`!kick`, `!ban`, `!unban`, `!mute`, `!unmute`, `!warn`, `!warnings`, `!unwarn`).
+Enforces role hierarchy checks and persists warning logs to `data/moderation.json`.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any, Dict, Optional
+
 import discord
 from discord.ext import commands
-import json
-import os
-from datetime import datetime, timedelta
+
+from config import Config
+from utils.storage import load_json, save_json
+
 
 class Moderation(commands.Cog):
-    """Sistema de moderação: banir, kickar, mutar, avisar"""
-    
-    def __init__(self, bot):
+    """Role-checked moderation actions and persistent warning escalation."""
+
+    def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
-        self.config_file = "moderation_config.json"
-        self.config = self.load_config()
-    
-    def load_config(self):
-        if os.path.exists(self.config_file):
-            with open(self.config_file, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        return {"users": {}, "tempbans": []}
-    
-    def save_config(self):
-        with open(self.config_file, 'w', encoding='utf-8') as f:
-            json.dump(self.config, f, indent=4, ensure_ascii=False)
-    
+        self.file_path = Config.MODERATION_FILE
+        self.state: Dict[str, Any] = load_json(
+            self.file_path,
+            default={"users": {}, "tempbans": []},
+        )
+
+    def _persist(self) -> None:
+        save_json(self.file_path, self.state)
+
+    @staticmethod
+    def _can_moderate(ctx: commands.Context, target: discord.Member) -> Optional[str]:
+        """Validate that the moderator outranks the target member."""
+        if target.id == ctx.author.id:
+            return "❌ Você não pode executar esta ação em si mesmo."
+        if ctx.guild and target.id == ctx.guild.owner_id:
+            return "❌ Não é possível moderar o proprietário do servidor."
+        if (
+            isinstance(ctx.author, discord.Member)
+            and ctx.guild
+            and ctx.author.id != ctx.guild.owner_id
+            and target.top_role >= ctx.author.top_role
+        ):
+            return "❌ O membro possui um cargo igual ou superior ao seu."
+        return None
+
     @commands.command()
     @commands.has_permissions(kick_members=True)
-    async def kick(self, ctx, membro: discord.Member, *, razao="Sem razão especificada"):
-        """Coloca um membro para fora do servidor"""
-        if membro == ctx.author:
-            await ctx.send("❌ Você não pode kickar a si mesmo!")
+    async def kick(
+        self,
+        ctx: commands.Context,
+        membro: discord.Member,
+        *,
+        razao: str = "Sem razão especificada",
+    ) -> None:
+        """Kick a member from the guild."""
+        err = self._can_moderate(ctx, membro)
+        if err:
+            await ctx.send(err)
             return
-        
-        if membro.top_role >= ctx.author.top_role:
-            await ctx.send("❌ Você não tem permissão para isso!")
-            return
-        
+
         try:
             await membro.kick(reason=f"{ctx.author}: {razao}")
             embed = discord.Embed(
-                title="🦶 Membro kickado",
-                description=f"**{membro}** foi removido do servidor",
-                color=discord.Color.orange()
+                title="🦶 Membro expulso",
+                description=f"**{membro}** foi removido do servidor.",
+                color=discord.Color.orange(),
             )
             embed.add_field(name="Razão", value=razao, inline=False)
             embed.add_field(name="Moderador", value=ctx.author.mention, inline=False)
             await ctx.send(embed=embed)
-        except Exception as e:
-            await ctx.send(f"❌ Erro ao kickar: {str(e)}")
-    
+        except discord.HTTPException as exc:
+            await ctx.send(f"❌ Falha ao expulsar membro: {exc}")
+
     @commands.command()
     @commands.has_permissions(ban_members=True)
-    async def ban(self, ctx, membro: discord.Member, *, razao="Sem razão especificada"):
-        """Bane um membro do servidor"""
-        if membro == ctx.author:
-            await ctx.send("❌ Você não pode banir a si mesmo!")
+    async def ban(
+        self,
+        ctx: commands.Context,
+        membro: discord.Member,
+        *,
+        razao: str = "Sem razão especificada",
+    ) -> None:
+        """Ban a member and purge their last 24 hours of messages."""
+        err = self._can_moderate(ctx, membro)
+        if err:
+            await ctx.send(err)
             return
-        
-        if membro.top_role >= ctx.author.top_role:
-            await ctx.send("❌ Você não tem permissão para isso!")
-            return
-        
+
         try:
             await membro.ban(reason=f"{ctx.author}: {razao}", delete_message_seconds=86400)
             embed = discord.Embed(
                 title="🚫 Membro banido",
-                description=f"**{membro}** foi banido do servidor",
-                color=discord.Color.red()
+                description=f"**{membro}** foi banido permanentemente.",
+                color=discord.Color.red(),
             )
             embed.add_field(name="Razão", value=razao, inline=False)
             embed.add_field(name="Moderador", value=ctx.author.mention, inline=False)
             await ctx.send(embed=embed)
-        except Exception as e:
-            await ctx.send(f"❌ Erro ao banir: {str(e)}")
-    
+        except discord.HTTPException as exc:
+            await ctx.send(f"❌ Falha ao banir membro: {exc}")
+
     @commands.command()
     @commands.has_permissions(ban_members=True)
-    async def unban(self, ctx, usuario: str):
-        """Remove um ban"""
-        bans = await ctx.guild.bans()
-        
-        for ban in bans:
-            if ban.user.name.lower() == usuario.lower() or str(ban.user.id) == usuario:
+    async def unban(self, ctx: commands.Context, *, usuario: str) -> None:
+        """Revoke an active ban by username or numeric Discord ID."""
+        query = usuario.strip().lower()
+
+        async for entry in ctx.guild.bans():
+            if entry.user.name.lower() == query or str(entry.user.id) == query:
                 try:
-                    await ctx.guild.unban(ban.user, reason=f"Removido por {ctx.author}")
+                    await ctx.guild.unban(entry.user, reason=f"Desbanido por {ctx.author}")
                     embed = discord.Embed(
-                        title="✅ Ban removido",
-                        description=f"**{ban.user}** teve o ban removido",
-                        color=discord.Color.green()
+                        title="✅ Banimento removido",
+                        description=f"**{entry.user}** foi desbanido.",
+                        color=discord.Color.green(),
                     )
                     await ctx.send(embed=embed)
                     return
-                except Exception as e:
-                    await ctx.send(f"❌ Erro: {str(e)}")
+                except discord.HTTPException as exc:
+                    await ctx.send(f"❌ Falha ao remover ban: {exc}")
                     return
-        
-        await ctx.send(f"❌ Usuário **{usuario}** não encontrado na lista de bans")
-    
+
+        await ctx.send(f"❌ Usuário `{usuario}` não encontrado na lista de banimentos.")
+
     @commands.command()
     @commands.has_permissions(manage_roles=True)
-    async def mute(self, ctx, membro: discord.Member, tempo_min: int = None, *, razao="Sem razão"):
-        """Muta um usuário (remove permissão de enviar mensagens)"""
-        if membro == ctx.author:
-            await ctx.send("❌ Você não pode mutar a si mesmo!")
+    async def mute(
+        self,
+        ctx: commands.Context,
+        membro: discord.Member,
+        tempo_min: Optional[int] = None,
+        *,
+        razao: str = "Sem razão especificada",
+    ) -> None:
+        """Assign the muted role to a member, creating channel overrides if needed."""
+        err = self._can_moderate(ctx, membro)
+        if err:
+            await ctx.send(err)
             return
-        
-        muted_role = discord.utils.get(ctx.guild.roles, name="Mutado")
-        if not muted_role:
+
+        muted_role = discord.utils.get(ctx.guild.roles, name=Config.MUTE_ROLE_NAME)
+        if muted_role is None:
             try:
                 muted_role = await ctx.guild.create_role(
-                    name="Mutado",
-                    reason="Role para usuários mutados"
+                    name=Config.MUTE_ROLE_NAME,
+                    reason="Cargo automático para membros silenciados",
                 )
-                # Remove permissão de enviar mensagens
-                for canal in ctx.guild.text_channels:
-                    await canal.set_permissions(muted_role, send_messages=False)
-            except Exception as e:
-                await ctx.send(f"❌ Erro ao criar role: {str(e)}")
+                for channel in ctx.guild.text_channels:
+                    await channel.set_permissions(muted_role, send_messages=False)
+            except discord.HTTPException as exc:
+                await ctx.send(f"❌ Não foi possível criar o cargo `{Config.MUTE_ROLE_NAME}`: {exc}")
                 return
-        
+
         try:
             await membro.add_roles(muted_role, reason=f"{ctx.author}: {razao}")
             embed = discord.Embed(
-                title="🔇 Membro mutado",
-                description=f"**{membro}** foi mutado",
-                color=discord.Color.orange()
+                title="🔇 Membro silenciado",
+                description=f"**{membro}** recebeu o cargo `{Config.MUTE_ROLE_NAME}`.",
+                color=discord.Color.orange(),
             )
             if tempo_min:
-                embed.add_field(name="Duração", value=f"{tempo_min} minutos")
+                embed.add_field(name="Duração sugerida", value=f"{tempo_min} minutos", inline=True)
             embed.add_field(name="Razão", value=razao, inline=False)
             await ctx.send(embed=embed)
-        except Exception as e:
-            await ctx.send(f"❌ Erro ao mutar: {str(e)}")
-    
+        except discord.HTTPException as exc:
+            await ctx.send(f"❌ Falha ao silenciar membro: {exc}")
+
     @commands.command()
     @commands.has_permissions(manage_roles=True)
-    async def unmute(self, ctx, membro: discord.Member):
-        """Remove mute de um usuário"""
-        muted_role = discord.utils.get(ctx.guild.roles, name="Mutado")
-        
-        if not muted_role:
-            await ctx.send("❌ Nenhum usuário está mutado")
+    async def unmute(self, ctx: commands.Context, membro: discord.Member) -> None:
+        """Remove the muted role from a member."""
+        muted_role = discord.utils.get(ctx.guild.roles, name=Config.MUTE_ROLE_NAME)
+        if muted_role is None or muted_role not in membro.roles:
+            await ctx.send(f"❌ **{membro.display_name}** não está silenciado.")
             return
-        
+
         try:
             await membro.remove_roles(muted_role, reason=f"Desmutado por {ctx.author}")
             embed = discord.Embed(
-                title="🔊 Membro desmutado",
-                description=f"**{membro}** pode enviar mensagens novamente",
-                color=discord.Color.green()
+                title="🔊 Silenciamento removido",
+                description=f"**{membro}** pode enviar mensagens novamente.",
+                color=discord.Color.green(),
             )
             await ctx.send(embed=embed)
-        except Exception as e:
-            await ctx.send(f"❌ Erro: {str(e)}")
-    
+        except discord.HTTPException as exc:
+            await ctx.send(f"❌ Falha ao remover silenciamento: {exc}")
+
     @commands.command()
     @commands.has_permissions(manage_messages=True)
-    async def warn(self, ctx, membro: discord.Member, *, razao="Sem razão"):
-        """Avisa um usuário"""
-        user_id = str(membro.id)
-        
-        if "users" not in self.config:
-            self.config["users"] = {}
-        
-        if user_id not in self.config["users"]:
-            self.config["users"][user_id] = {"warns": 0, "motivos": []}
-        
-        self.config["users"][user_id]["warns"] += 1
-        self.config["users"][user_id]["motivos"].append({
-            "razao": razao,
-            "moderador": str(ctx.author),
-            "data": datetime.now().isoformat()
-        })
-        self.save_config()
-        
-        warns = self.config["users"][user_id]["warns"]
-        
-        embed = discord.Embed(
-            title="⚠️ Aviso",
-            description=f"**{membro}** recebeu um aviso",
-            color=discord.Color.orange()
+    async def warn(
+        self,
+        ctx: commands.Context,
+        membro: discord.Member,
+        *,
+        razao: str = "Sem razão especificada",
+    ) -> None:
+        """Issue a formal warning; automatically bans the member upon reaching `Config.WARN_LIMIT`."""
+        err = self._can_moderate(ctx, membro)
+        if err:
+            await ctx.send(err)
+            return
+
+        users = self.state.setdefault("users", {})
+        record = users.setdefault(str(membro.id), {"warns": 0, "motivos": []})
+
+        record["warns"] += 1
+        record["motivos"].append(
+            {
+                "razao": razao,
+                "moderador": str(ctx.author),
+                "data": datetime.now().isoformat(),
+            }
         )
-        embed.add_field(name="Aviso #", value=warns, inline=False)
+        self._persist()
+
+        warn_count = int(record["warns"])
+        embed = discord.Embed(
+            title="⚠️ Aviso registrado",
+            description=f"**{membro}** recebeu um aviso disciplinar.",
+            color=discord.Color.orange(),
+        )
         embed.add_field(name="Razão", value=razao, inline=False)
-        embed.add_field(name="Total de avisos", value=f"{warns}/3", inline=False)
+        embed.add_field(name="Acumulado", value=f"{warn_count}/{Config.WARN_LIMIT}", inline=True)
+        embed.add_field(name="Moderador", value=ctx.author.mention, inline=True)
         await ctx.send(embed=embed)
-        
-        # Auto-ban em 3 avisos
-        if warns >= 3:
+
+        if warn_count >= Config.WARN_LIMIT:
             try:
-                await membro.ban(reason="Excedeu limite de avisos (3/3)")
-                await ctx.send(f"🚫 **{membro}** foi banido automaticamente (3 avisos)")
-            except:
-                pass
-    
+                await membro.ban(reason=f"Atingiu o limite de {Config.WARN_LIMIT} avisos.")
+                await ctx.send(f"🚫 **{membro}** atingiu {Config.WARN_LIMIT} avisos e foi banido automaticamente.")
+            except discord.HTTPException:
+                await ctx.send(
+                    f"⚠️ **{membro}** atingiu {Config.WARN_LIMIT} avisos, mas o bot não possui permissão para bani-lo."
+                )
+
     @commands.command()
-    async def warnings(self, ctx, membro: discord.Member = None):
-        """Mostra avisos de um usuário"""
-        if not membro:
-            membro = ctx.author
-        
-        user_id = str(membro.id)
-        
-        if user_id not in self.config.get("users", {}):
-            await ctx.send(f"**{membro}** não tem avisos")
+    async def warnings(
+        self,
+        ctx: commands.Context,
+        membro: Optional[discord.Member] = None,
+    ) -> None:
+        """List all recorded warnings for a member."""
+        target = membro or ctx.author
+        record = self.state.get("users", {}).get(str(target.id))
+
+        if not record or not record.get("warns"):
+            await ctx.send(f"**{target.display_name}** não possui avisos registrados.")
             return
-        
-        user_data = self.config["users"][user_id]
-        warns = user_data["warns"]
-        
+
         embed = discord.Embed(
-            title=f"⚠️ Avisos de {membro}",
-            description=f"Total: {warns}/3",
-            color=discord.Color.orange()
+            title=f"⚠️ Histórico de Avisos — {target.display_name}",
+            description=f"Total acumulado: **{record['warns']}/{Config.WARN_LIMIT}**",
+            color=discord.Color.orange(),
         )
-        
-        for i, aviso in enumerate(user_data["motivos"], 1):
+
+        for idx, item in enumerate(record.get("motivos", []), start=1):
             embed.add_field(
-                name=f"Aviso #{i}",
-                value=f"Razão: {aviso['razao']}\nModerador: {aviso['moderador']}",
-                inline=False
+                name=f"Aviso #{idx}",
+                value=f"Razão: {item['razao']}\nModerador: {item['moderador']}",
+                inline=False,
             )
-        
+
         await ctx.send(embed=embed)
-    
+
     @commands.command()
     @commands.has_permissions(manage_messages=True)
-    async def unwarn(self, ctx, membro: discord.Member):
-        """Remove um aviso"""
-        user_id = str(membro.id)
-        
-        if user_id not in self.config.get("users", {}) or self.config["users"][user_id]["warns"] == 0:
-            await ctx.send(f"**{membro}** não tem avisos para remover")
+    async def unwarn(self, ctx: commands.Context, membro: discord.Member) -> None:
+        """Remove the most recent warning from a member's record."""
+        record = self.state.get("users", {}).get(str(membro.id))
+        if not record or record.get("warns", 0) <= 0:
+            await ctx.send(f"**{membro.display_name}** não possui avisos para remover.")
             return
-        
-        self.config["users"][user_id]["warns"] -= 1
-        self.config["users"][user_id]["motivos"].pop()
-        self.save_config()
-        
-        await ctx.send(f"✅ Um aviso de **{membro}** foi removido")
+
+        record["warns"] -= 1
+        if record.get("motivos"):
+            record["motivos"].pop()
+        self._persist()
+
+        await ctx.send(
+            f"✅ Último aviso de **{membro.display_name}** removido (restam {record['warns']}/{Config.WARN_LIMIT})."
+        )
 
 
-async def setup(bot):
+async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(Moderation(bot))

@@ -1,324 +1,349 @@
+"""
+Twitch Helix API livestream monitor (`!stream`, `!streamset`).
+Polls tracked channels in the background and posts a notification embed when a stream goes live.
+"""
+
+from __future__ import annotations
+
+import logging
+from datetime import datetime
+from typing import Any, Dict, Optional, Set
+
+import aiohttp
 import discord
 from discord.ext import commands, tasks
-import json
-import os
-from datetime import datetime
-import aiohttp
+
+from config import Config
+from utils.storage import load_json, save_json
+
+logger = logging.getLogger("ndb.streams")
+
 
 class Streams(commands.Cog):
-    """Monitora e notifica sobre streamers do Twitch e YouTube via API real"""
-    
-    def __init__(self, bot):
+    """Livestream tracker backed by the Twitch Helix API."""
+
+    def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
-        self.config_file = "streams_config.json"
-        self.config = self.load_config()
-        self.notified_streamers = set()
-        self.twitch_token = os.getenv("TWITCH_TOKEN")
-        self.twitch_client_id = os.getenv("TWITCH_CLIENT_ID")
-        self.check_streams.start()
-    
-    def load_config(self):
-        """Carrega configuração de arquivo"""
-        if os.path.exists(self.config_file):
-            with open(self.config_file, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        return {"notify_channel": None, "streamers": []}
-    
-    def save_config(self):
-        """Salva configuração em arquivo"""
-        with open(self.config_file, 'w', encoding='utf-8') as f:
-            json.dump(self.config, f, indent=4, ensure_ascii=False)
-    
-    async def check_twitch_status(self, usuario):
-        """Verifica status REAL de uma live na Twitch via API"""
+        self.file_path = Config.STREAMS_FILE
+        self.state: Dict[str, Any] = load_json(
+            self.file_path,
+            default={"notify_channel": None, "streamers": []},
+        )
+        self.active_Broadcasts: Set[str] = set()
+        self.twitch_token = Config.TWITCH_TOKEN
+        self.twitch_client_id = Config.TWITCH_CLIENT_ID
+        self.http_session: Optional[aiohttp.ClientSession] = None
+        self.poll_streams.start()
+
+    def _persist(self) -> None:
+        save_json(self.file_path, self.state)
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self.http_session is None or self.http_session.closed:
+            self.http_session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=15)
+            )
+        return self.http_session
+
+    async def query_twitch_stream(self, login: str) -> Optional[Dict[str, Any]]:
+        """Query the Twitch Helix API for a user's current live broadcast status."""
         if not self.twitch_token or not self.twitch_client_id:
             return None
-        
+
+        headers = {
+            "Client-ID": self.twitch_client_id,
+            "Authorization": f"Bearer {self.twitch_token}",
+        }
+
         try:
-            async with aiohttp.ClientSession() as session:
-                url = f"https://api.twitch.tv/helix/users?login={usuario}"
-                headers = {
-                    "Client-ID": self.twitch_client_id,
-                    "Authorization": f"Bearer {self.twitch_token}"
+            session = await self._get_session()
+            async with session.get(
+                "https://api.twitch.tv/helix/streams",
+                params={"user_login": login},
+                headers=headers,
+            ) as resp:
+                if resp.status != 200:
+                    logger.warning("Twitch API returned HTTP %d for login=%s", resp.status, login)
+                    return None
+
+                payload = await resp.json()
+                entries = payload.get("data", [])
+                if not entries:
+                    return {"online": False}
+
+                stream = entries[0]
+                return {
+                    "online": True,
+                    "title": stream.get("title") or "Sem título",
+                    "game": stream.get("game_name") or "Sem categoria",
+                    "viewers": int(stream.get("viewer_count", 0)),
+                    "url": f"https://twitch.tv/{login}",
                 }
-                
-                async with session.get(url, headers=headers) as resp:
-                    if resp.status != 200:
-                        return None
-                    data = await resp.json()
-                    if not data.get("data"):
-                        return None
-                    
-                    user_id = data["data"][0]["id"]
-                    
-                    stream_url = f"https://api.twitch.tv/helix/streams?user_id={user_id}"
-                    async with session.get(stream_url, headers=headers) as stream_resp:
-                        if stream_resp.status != 200:
-                            return None
-                        stream_data = await stream_resp.json()
-                        if stream_data.get("data"):
-                            stream = stream_data["data"][0]
-                            return {
-                                "online": True,
-                                "title": stream.get("title"),
-                                "game": stream.get("game_name"),
-                                "viewers": stream.get("viewer_count"),
-                                "url": f"https://twitch.tv/{usuario}"
-                            }
-                        return {"online": False}
-        except Exception as e:
-            print(f"Erro ao checar Twitch: {e}")
+        except aiohttp.ClientError as exc:
+            logger.warning("Twitch request error for %s: %s", login, exc)
             return None
-    
-    @commands.group()
+
+    @commands.group(invoke_without_command=True)
     @commands.has_permissions(manage_guild=True)
-    async def streamset(self, ctx):
-        """Configurações de streams"""
-        if ctx.invoked_subcommand is None:
-            embed = discord.Embed(
-                title="⚙️ Configuração de Streams",
-                description="Direcionar notificações de streams",
-                color=discord.Color.purple()
-            )
-            embed.add_field(
-                name="Subcomandos",
-                value="`!streamset channel [#canal]` - Define canal\n"
-                      "`!streamset show` - Mostra config\n"
-                      "`!streamset credentials` - Como obter credenciais Twitch",
-                inline=False
-            )
-            await ctx.send(embed=embed)
-    
+    async def streamset(self, ctx: commands.Context) -> None:
+        """Configure livestream alert channel and inspect Twitch API credentials status."""
+        embed = discord.Embed(
+            title="⚙️ Configuração de Streams",
+            description="Defina o canal de alertas e verifique a integração com a Twitch.",
+            color=discord.Color.purple(),
+        )
+        embed.add_field(
+            name="Subcomandos",
+            value=(
+                "`!streamset channel <#canal>` — Define o canal de anúncios\n"
+                "`!streamset show` — Exibe a configuração atual\n"
+                "`!streamset credentials` — Guia de configuração da API Twitch"
+            ),
+            inline=False,
+        )
+        await ctx.send(embed=embed)
+
     @streamset.command(name="channel")
-    async def set_channel(self, ctx, canal: discord.TextChannel):
-        """Define canal de notificações"""
-        self.config["notify_channel"] = canal.id
-        self.save_config()
+    async def set_channel(self, ctx: commands.Context, canal: discord.TextChannel) -> None:
+        """Set the text channel where live alerts will be posted."""
+        self.state["notify_channel"] = canal.id
+        self._persist()
+
         embed = discord.Embed(
-            title="✅ Canal configurado",
-            description=f"Notificações em {canal.mention}",
-            color=discord.Color.green()
+            title="✅ Canal de alertas atualizado",
+            description=f"As notificações de live serão enviadas em {canal.mention}.",
+            color=discord.Color.green(),
         )
         await ctx.send(embed=embed)
-    
+
     @streamset.command(name="show")
-    async def show_config(self, ctx):
-        """Mostra configuração"""
-        notify_channel = self.config.get("notify_channel")
-        canal_text = f"<#{notify_channel}>" if notify_channel else "Não configurado"
-        
+    async def show_config(self, ctx: commands.Context) -> None:
+        """Display the active alert channel, tracked count, and API readiness."""
+        channel_id = self.state.get("notify_channel")
+        channel_label = f"<#{channel_id}>" if channel_id else "Não configurado"
+        guild_streamers = [
+            s for s in self.state.get("streamers", []) if s.get("guild_id") == ctx.guild.id
+        ]
+        api_ready = bool(self.twitch_token and self.twitch_client_id)
+
         embed = discord.Embed(
-            title="📡 Configuração de Streams",
-            color=discord.Color.purple()
+            title="📡 Status do Monitoramento",
+            color=discord.Color.purple(),
         )
-        embed.add_field(name="Canal", value=canal_text, inline=False)
-        embed.add_field(name="Streamers", value=f"{len(self.config.get('streamers', []))}", inline=False)
-        embed.add_field(name="Status API", value="Pronto para Twitch ✅" if self.twitch_token else "Configure token ⚠️", inline=False)
+        embed.add_field(name="Canal de alertas", value=channel_label, inline=True)
+        embed.add_field(name="Canais monitorados", value=str(len(guild_streamers)), inline=True)
+        embed.add_field(
+            name="Twitch Helix API",
+            value="Configurada ✅" if api_ready else "Credenciais ausentes ⚠️",
+            inline=False,
+        )
         await ctx.send(embed=embed)
-    
+
     @streamset.command(name="credentials")
-    async def show_credentials(self, ctx):
-        """Instruções para obter credenciais Twitch"""
+    async def show_credentials(self, ctx: commands.Context) -> None:
+        """Show setup steps for Twitch Helix OAuth credentials."""
         embed = discord.Embed(
-            title="🔑 Como obter credenciais Twitch",
-            description="Siga estes passos para habilitar monitoramento automático:",
-            color=discord.Color.blue()
+            title="🔑 Configurando a API da Twitch",
+            description="Para habilitar a checagem automática de lives:",
+            color=discord.Color.blue(),
         )
         embed.add_field(
-            name="1. Crie uma aplicação",
-            value="Acesse: https://dev.twitch.tv/console/apps\nClique em 'Create Application'",
-            inline=False
+            name="1. Portal de Desenvolvedores",
+            value="Acesse https://dev.twitch.tv/console/apps e registre uma aplicação.",
+            inline=False,
         )
         embed.add_field(
-            name="2. Copie as credenciais",
-            value="Copie: Client ID e Client Secret",
-            inline=False
-        )
-        embed.add_field(
-            name="3. Gere um token OAuth",
-            value="No painel do Twitch, gere um token de aplicação",
-            inline=False
-        )
-        embed.add_field(
-            name="4. Configure no bot",
-            value="Adicione ao `.env`:\n`TWITCH_CLIENT_ID=seu_id`\n`TWITCH_TOKEN=seu_token`",
-            inline=False
-        )
-        embed.add_field(
-            name="5. Reinicie o bot",
-            value="Os comandos de stream farão verificações em tempo real!",
-            inline=False
+            name="2. Variáveis de Ambiente (.env)",
+            value=(
+                "Preencha no arquivo `.env` na raiz do bot:\n"
+                "```env\n"
+                "TWITCH_CLIENT_ID=seu_client_id\n"
+                "TWITCH_TOKEN=seu_app_access_token\n"
+                "```"
+            ),
+            inline=False,
         )
         await ctx.send(embed=embed)
-    
-    @commands.group()
-    async def stream(self, ctx):
-        """Gerencia monitoramento de streamers"""
-        if ctx.invoked_subcommand is None:
-            embed = discord.Embed(
-                title="📡 Gerenciar Streams",
-                color=discord.Color.blue()
-            )
-            embed.add_field(
-                name="Subcomandos",
-                value="`!stream add twitch [usuario]` - Adicionar\n"
-                      "`!stream remove [usuario]` - Remover\n"
-                      "`!stream list` - Listar\n"
-                      "`!stream check [usuario]` - Checar AGORA (requer API)",
-                inline=False
-            )
-            await ctx.send(embed=embed)
-    
+
+    @commands.group(invoke_without_command=True)
+    async def stream(self, ctx: commands.Context) -> None:
+        """Manage the list of streamers tracked in this server."""
+        embed = discord.Embed(
+            title="📡 Monitoramento de Streamers",
+            color=discord.Color.blue(),
+        )
+        embed.add_field(
+            name="Subcomandos",
+            value=(
+                "`!stream add twitch <login>` — Adiciona um canal ao monitoramento\n"
+                "`!stream remove <login>` — Remove um canal da lista\n"
+                "`!stream list` — Lista os canais monitorados neste servidor\n"
+                "`!stream check <login>` — Consulta o status da live imediatamente"
+            ),
+            inline=False,
+        )
+        await ctx.send(embed=embed)
+
     @stream.command(name="add")
     @commands.has_permissions(manage_guild=True)
-    async def add_stream(self, ctx, tipo: str, usuario: str):
-        """Adiciona streamer ao monitoramento"""
-        if tipo.lower() not in ["twitch", "youtube"]:
-            await ctx.send("❌ Use: `twitch` ou `youtube`")
+    async def add_stream(self, ctx: commands.Context, plataforma: str, usuario: str) -> None:
+        """Track a Twitch or YouTube creator in the current guild."""
+        platform = plataforma.lower().strip()
+        login = usuario.lower().strip()
+
+        if platform not in {"twitch", "youtube"}:
+            await ctx.send("❌ Plataforma inválida. Use `twitch` ou `youtube`.")
             return
-        
-        for s in self.config.get("streamers", []):
-            if s["nome"].lower() == usuario.lower() and s["guild_id"] == ctx.guild.id:
-                await ctx.send(f"⚠️ Já monitorando **{usuario}**")
+
+        streamers = self.state.setdefault("streamers", [])
+        for entry in streamers:
+            if entry["nome"].lower() == login and entry.get("guild_id") == ctx.guild.id:
+                await ctx.send(f"⚠️ O canal **{usuario}** já está sendo monitorado.")
                 return
-        
-        if "streamers" not in self.config:
-            self.config["streamers"] = []
-        
-        self.config["streamers"].append({
-            "tipo": tipo.lower(),
-            "nome": usuario,
-            "guild_id": ctx.guild.id,
-            "adicionado_por": str(ctx.author),
-            "data": datetime.now().isoformat()
-        })
-        self.save_config()
-        
+
+        streamers.append(
+            {
+                "tipo": platform,
+                "nome": login,
+                "guild_id": ctx.guild.id,
+                "adicionado_por": str(ctx.author),
+                "data": datetime.now().isoformat(),
+            }
+        )
+        self._persist()
+
         embed = discord.Embed(
-            title="✅ Streamer adicionado",
-            description=f"Monitorando **{usuario}**",
-            color=discord.Color.green()
+            title="✅ Canal adicionado",
+            description=f"**{login}** ({platform.title()}) foi incluído no monitoramento.",
+            color=discord.Color.green(),
         )
         await ctx.send(embed=embed)
-    
+
     @stream.command(name="remove")
     @commands.has_permissions(manage_guild=True)
-    async def remove_stream(self, ctx, usuario: str):
-        """Remove streamer"""
-        original_count = len(self.config.get("streamers", []))
-        self.config["streamers"] = [
-            s for s in self.config.get("streamers", [])
-            if not (s["nome"].lower() == usuario.lower() and s["guild_id"] == ctx.guild.id)
+    async def remove_stream(self, ctx: commands.Context, usuario: str) -> None:
+        """Stop tracking a streamer in the current guild."""
+        login = usuario.lower().strip()
+        before = len(self.state.get("streamers", []))
+        self.state["streamers"] = [
+            s
+            for s in self.state.get("streamers", [])
+            if not (s["nome"].lower() == login and s.get("guild_id") == ctx.guild.id)
         ]
-        self.save_config()
-        
-        if len(self.config["streamers"]) < original_count:
-            await ctx.send(f"✅ Deixamos de monitorar **{usuario}**")
+        self._persist()
+
+        if len(self.state["streamers"]) < before:
+            await ctx.send(f"✅ O canal **{usuario}** foi removido do monitoramento.")
         else:
-            await ctx.send(f"❌ **{usuario}** não encontrado")
-    
+            await ctx.send(f"❌ **{usuario}** não consta na lista deste servidor.")
+
     @stream.command(name="list")
-    async def list_streams(self, ctx):
-        """Lista streamers do servidor"""
-        streamers = [
-            s for s in self.config.get("streamers", [])
-            if s["guild_id"] == ctx.guild.id
+    async def list_streams(self, ctx: commands.Context) -> None:
+        """List all creators currently tracked in this guild."""
+        guild_streamers = [
+            s for s in self.state.get("streamers", []) if s.get("guild_id") == ctx.guild.id
         ]
-        
-        if not streamers:
-            await ctx.send("Nenhum streamer monitorado")
+        if not guild_streamers:
+            await ctx.send("Nenhum canal monitorado neste servidor.")
             return
-        
+
         embed = discord.Embed(
-            title="📡 Streamers do Servidor",
-            description=f"Total: {len(streamers)}",
-            color=discord.Color.purple()
+            title="📡 Canais Monitorados",
+            description=f"Total: **{len(guild_streamers)}**",
+            color=discord.Color.purple(),
         )
-        
-        for s in streamers:
-            emoji = "🟣" if s["tipo"] == "twitch" else "🔴"
+
+        for entry in guild_streamers:
+            badge = "🟣 Twitch" if entry["tipo"] == "twitch" else "🔴 YouTube"
             embed.add_field(
-                name=f"{emoji} {s['nome']}",
-                value=f"Adicionado por: {s['adicionado_por']}",
-                inline=False
+                name=f"{badge} — {entry['nome']}",
+                value=f"Adicionado por: {entry.get('adicionado_por', 'desconhecido')}",
+                inline=False,
             )
-        
+
         await ctx.send(embed=embed)
-    
+
     @stream.command(name="check")
-    async def check_streamer(self, ctx, usuario: str):
-        """Verifica status atual via API Twitch"""
-        if not self.twitch_token:
-            await ctx.send("❌ Configure credenciais com `!streamset credentials`")
+    async def check_streamer(self, ctx: commands.Context, usuario: str) -> None:
+        """Perform an on-demand live check against the Twitch Helix endpoint."""
+        if not self.twitch_token or not self.twitch_client_id:
+            await ctx.send("❌ Credenciais da Twitch não configuradas. Veja `!streamset credentials`.")
             return
-        
+
+        login = usuario.lower().strip()
         async with ctx.typing():
-            status = await self.check_twitch_status(usuario)
-            
+            status = await self.query_twitch_stream(login)
             if status is None:
-                await ctx.send(f"❌ Erro ao buscar **{usuario}**")
+                await ctx.send(f"❌ Não foi possível consultar `{login}` na API da Twitch.")
                 return
-            
-            if status["online"]:
+
+            if status.get("online"):
                 embed = discord.Embed(
-                    title="🔴 AO VIVO!",
-                    description=f"**{usuario}** está transmitindo",
-                    color=discord.Color.red()
+                    title=f"🔴 {login} está AO VIVO!",
+                    description=status["title"][:200],
+                    url=status["url"],
+                    color=discord.Color.red(),
                 )
-                embed.add_field(name="Título", value=status["title"][:100], inline=False)
-                embed.add_field(name="Jogo", value=status["game"] or "Sem categoria", inline=True)
-                embed.add_field(name="Viewers", value=f"{status['viewers']:,}", inline=True)
-                embed.add_field(name="Link", value=f"[Assistir]({status['url']})", inline=False)
+                embed.add_field(name="Categoria", value=status["game"], inline=True)
+                embed.add_field(name="Espectadores", value=f"{status['viewers']:,}", inline=True)
+                embed.add_field(name="Stream", value=f"[Assistir na Twitch]({status['url']})", inline=False)
             else:
                 embed = discord.Embed(
                     title="⚫ Offline",
-                    description=f"**{usuario}** não está transmitindo",
-                    color=discord.Color.gray()
+                    description=f"**{login}** não está em transmissão no momento.",
+                    color=discord.Color.dark_grey(),
                 )
-            
+
             await ctx.send(embed=embed)
-    
-    @tasks.loop(minutes=15)
-    async def check_streams(self):
-        """Verifica streamers a cada 15 minutos - REQUER API Twitch configurada"""
-        if not self.config.get("notify_channel") or not self.twitch_token:
+
+    @tasks.loop(minutes=Config.TWITCH_CHECK_INTERVAL)
+    async def poll_streams(self) -> None:
+        """Periodic background task that checks tracked Twitch channels for live transitions."""
+        channel_id = self.state.get("notify_channel")
+        if not channel_id or not self.twitch_token or not self.twitch_client_id:
             return
-        
-        notify_channel = self.bot.get_channel(self.config["notify_channel"])
-        if not notify_channel:
+
+        notify_channel = self.bot.get_channel(int(channel_id))
+        if not isinstance(notify_channel, discord.TextChannel):
             return
-        
-        for streamer in self.config.get("streamers", []):
-            if streamer["tipo"] != "twitch":
+
+        for entry in self.state.get("streamers", []):
+            if entry.get("tipo") != "twitch":
                 continue
-            
-            streamer_key = f"{streamer['nome']}_{notify_channel.guild.id}"
-            status = await self.check_twitch_status(streamer["nome"])
-            
-            if status and status.get("online") and streamer_key not in self.notified_streamers:
+
+            login = entry["nome"].lower()
+            cache_key = f"{login}:{notify_channel.guild.id}"
+            status = await self.query_twitch_stream(login)
+
+            if status and status.get("online") and cache_key not in self.active_Broadcasts:
                 embed = discord.Embed(
-                    title="🔴 LIVE NA TWITCH!",
-                    description=f"**{streamer['nome']}** está transmitindo!",
-                    color=discord.Color.red()
+                    title=f"🔴 {entry['nome']} entrou ao vivo na Twitch!",
+                    description=status["title"][:200],
+                    url=status["url"],
+                    color=discord.Color.red(),
                 )
-                embed.add_field(name="📺 Título", value=status.get("title", "N/A")[:100], inline=False)
-                embed.add_field(name="🎮 Jogo", value=status.get("game", "Sem categoria"), inline=True)
-                embed.add_field(name="👥 Viewers", value=f"{status.get('viewers', 0):,}", inline=True)
-                embed.add_field(name="🔗", value=f"[Assistir agora]({status['url']})", inline=False)
-                
-                await notify_channel.send(embed=embed)
-                self.notified_streamers.add(streamer_key)
-            
-            elif not status or not status.get("online"):
-                self.notified_streamers.discard(streamer_key)
-    
-    @check_streams.before_loop
-    async def before_check_streams(self):
+                embed.add_field(name="Jogo", value=status["game"], inline=True)
+                embed.add_field(name="Viewers", value=f"{status['viewers']:,}", inline=True)
+                embed.add_field(name="Link", value=f"[Assistir agora]({status['url']})", inline=False)
+
+                try:
+                    await notify_channel.send(embed=embed)
+                    self.active_Broadcasts.add(cache_key)
+                except discord.HTTPException as exc:
+                    logger.warning("Failed to send stream alert in channel %s: %s", channel_id, exc)
+
+            elif status is not None and not status.get("online"):
+                self.active_Broadcasts.discard(cache_key)
+
+    @poll_streams.before_loop
+    async def before_poll_streams(self) -> None:
         await self.bot.wait_until_ready()
-    
-    def cog_unload(self):
-        self.check_streams.cancel()
+
+    def cog_unload(self) -> None:
+        self.poll_streams.cancel()
+        if self.http_session and not self.http_session.closed:
+            self.bot.loop.create_task(self.http_session.close())
 
 
-async def setup(bot):
+async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(Streams(bot))

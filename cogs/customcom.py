@@ -1,191 +1,184 @@
+"""
+Per-guild custom text commands (`!customcom create|list|delete|show`).
+Supports lightweight template placeholders (`{author}`, `{guild}`, `{timestamp}`).
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict
+
 import discord
 from discord.ext import commands
-import json
-import os
+
+from config import Config
+from utils.storage import load_json, save_json
+
 
 class CustomCom(commands.Cog):
-    """Permite que usuários criem comandos personalizados"""
-    
-    def __init__(self, bot):
+    """Guild-scoped custom text triggers managed by server staff."""
+
+    def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
-        self.config_file = "customcom_config.json"
-        self.config = self.load_config()
-    
-    def load_config(self):
-        if os.path.exists(self.config_file):
-            with open(self.config_file, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        return {}
-    
-    def save_config(self):
-        with open(self.config_file, 'w', encoding='utf-8') as f:
-            json.dump(self.config, f, indent=4, ensure_ascii=False)
-    
-    @commands.group()
-    async def customcom(self, ctx):
-        """Gerencia comandos personalizados"""
-        if ctx.invoked_subcommand is None:
-            embed = discord.Embed(
-                title="🛠️ Comandos Personalizados",
-                description="Use um dos subcomandos abaixo:",
-                color=discord.Color.purple()
-            )
-            embed.add_field(
-                name="Subcomandos",
-                value="`!customcom create [nome] [resposta]` - Cria comando\n"
-                      "`!customcom list` - Lista comandos\n"
-                      "`!customcom delete [nome]` - Delete comando\n"
-                      "`!customcom show [nome]` - Mostra resposta",
-                inline=False
-            )
-            await ctx.send(embed=embed)
-    
+        self.file_path = Config.CUSTOMCOM_FILE
+        self.store: Dict[str, Dict[str, Any]] = load_json(self.file_path, default={})
+
+    def _persist(self) -> None:
+        save_json(self.file_path, self.store)
+
+    @commands.group(invoke_without_command=True)
+    async def customcom(self, ctx: commands.Context) -> None:
+        """Display available custom command management subcommands."""
+        embed = discord.Embed(
+            title="🛠️ Comandos Personalizados",
+            description="Subcomandos disponíveis para este servidor:",
+            color=discord.Color.purple(),
+        )
+        embed.add_field(
+            name="Uso",
+            value=(
+                "`!customcom create <nome> <resposta>` — Cria um comando\n"
+                "`!customcom list` — Lista os comandos do servidor\n"
+                "`!customcom show <nome>` — Exibe o texto bruto de um comando\n"
+                "`!customcom delete <nome>` — Remove um comando"
+            ),
+            inline=False,
+        )
+        await ctx.send(embed=embed)
+
     @customcom.command()
     @commands.has_permissions(manage_guild=True)
-    async def create(self, ctx, nome: str, *, resposta: str):
-        """Cria um comando personalizado"""
-        nome = nome.lower()
-        
-        if len(nome) < 2:
-            await ctx.send("❌ Nome muito curto (mínimo 2 caracteres)")
+    async def create(self, ctx: commands.Context, nome: str, *, resposta: str) -> None:
+        """Register a new custom trigger for the current guild."""
+        trigger = nome.lower().lstrip(Config.COMMAND_PREFIX)
+        if len(trigger) < 2:
+            await ctx.send("❌ O nome do comando deve ter pelo menos 2 caracteres.")
             return
-        
+
         if len(resposta) > 2000:
-            await ctx.send("❌ Resposta muito longa (máximo 2000 caracteres)")
+            await ctx.send("❌ A resposta excede o limite de 2000 caracteres do Discord.")
             return
-        
-        guild_id = str(ctx.guild.id)
-        
-        if guild_id not in self.config:
-            self.config[guild_id] = {}
-        
-        if nome in self.config[guild_id]:
-            await ctx.send(f"❌ Comando **{nome}** já existe!")
+
+        # Prevent shadowing built-in bot commands
+        if self.bot.get_command(trigger):
+            await ctx.send(f"❌ `@{trigger}` já é um comando nativo do bot.")
             return
-        
-        self.config[guild_id][nome] = {
+
+        guild_key = str(ctx.guild.id)
+        guild_cmds = self.store.setdefault(guild_key, {})
+
+        if trigger in guild_cmds:
+            await ctx.send(f"❌ O comando `!{trigger}` já existe neste servidor.")
+            return
+
+        guild_cmds[trigger] = {
             "resposta": resposta,
             "criado_por": str(ctx.author),
-            "criado_em": str(ctx.message.created_at)
+            "criado_em": ctx.message.created_at.isoformat(),
         }
-        self.save_config()
-        
+        self._persist()
+
         embed = discord.Embed(
             title="✅ Comando criado",
-            description=f"Comando **!{nome}** criado com sucesso",
-            color=discord.Color.green()
+            description=f"Use `!{trigger}` para acionar a resposta.",
+            color=discord.Color.green(),
         )
         await ctx.send(embed=embed)
-    
-    @customcom.command()
-    async def list(self, ctx):
-        """Lista todos os comandos personalizados"""
-        guild_id = str(ctx.guild.id)
-        
-        if guild_id not in self.config or not self.config[guild_id]:
-            await ctx.send("Nenhum comando personalizado neste servidor")
+
+    @customcom.command(name="list")
+    async def list_commands(self, ctx: commands.Context) -> None:
+        """List custom commands registered in the current guild."""
+        guild_cmds = self.store.get(str(ctx.guild.id), {})
+        if not guild_cmds:
+            await ctx.send("Nenhum comando personalizado registrado neste servidor.")
             return
-        
-        comandos = list(self.config[guild_id].keys())
-        
+
+        names = sorted(guild_cmds.keys())
         embed = discord.Embed(
             title="📋 Comandos Personalizados",
-            description=f"Total: {len(comandos)}",
-            color=discord.Color.blue()
+            description=f"Total registrado: **{len(names)}**",
+            color=discord.Color.blue(),
         )
-        
-        # Limita a 20 por pagina
-        for cmd in comandos[:20]:
-            info = self.config[guild_id][cmd]
+
+        for name in names[:20]:
+            meta = guild_cmds[name]
             embed.add_field(
-                name=f"!{cmd}",
-                value=f"Criado por: {info['criado_por']}",
-                inline=False
+                name=f"!{name}",
+                value=f"Criado por: {meta.get('criado_por', 'desconhecido')}",
+                inline=False,
             )
-        
-        if len(comandos) > 20:
-            embed.set_footer(text=f"... e mais {len(comandos) - 20} comandos")
-        
+
+        if len(names) > 20:
+            embed.set_footer(text=f"Exibindo 20 de {len(names)} comandos.")
+
         await ctx.send(embed=embed)
-    
+
     @customcom.command()
     @commands.has_permissions(manage_guild=True)
-    async def delete(self, ctx, nome: str):
-        """Deleta um comando personalizado"""
-        nome = nome.lower()
-        guild_id = str(ctx.guild.id)
-        
-        if guild_id not in self.config or nome not in self.config[guild_id]:
-            await ctx.send(f"❌ Comando **{nome}** não encontrado")
+    async def delete(self, ctx: commands.Context, nome: str) -> None:
+        """Delete an existing custom command."""
+        trigger = nome.lower().lstrip(Config.COMMAND_PREFIX)
+        guild_cmds = self.store.get(str(ctx.guild.id), {})
+
+        if trigger not in guild_cmds:
+            await ctx.send(f"❌ Comando `!{trigger}` não encontrado.")
             return
-        
-        del self.config[guild_id][nome]
-        self.save_config()
-        
+
+        del guild_cmds[trigger]
+        self._persist()
+
         embed = discord.Embed(
-            title="✅ Comando deletado",
-            description=f"Comando **!{nome}** foi removido",
-            color=discord.Color.green()
+            title="✅ Comando removido",
+            description=f"O comando `!{trigger}` foi excluído.",
+            color=discord.Color.green(),
         )
         await ctx.send(embed=embed)
-    
+
     @customcom.command(name="show")
-    async def show_com(self, ctx, nome: str):
-        """Mostra o conteúdo de um comando"""
-        nome = nome.lower()
-        guild_id = str(ctx.guild.id)
-        
-        if guild_id not in self.config or nome not in self.config[guild_id]:
-            await ctx.send(f"❌ Comando **{nome}** não encontrado")
+    async def show_com(self, ctx: commands.Context, nome: str) -> None:
+        """Inspect the template text and author of a custom command."""
+        trigger = nome.lower().lstrip(Config.COMMAND_PREFIX)
+        guild_cmds = self.store.get(str(ctx.guild.id), {})
+
+        if trigger not in guild_cmds:
+            await ctx.send(f"❌ Comando `!{trigger}` não encontrado.")
             return
-        
-        info = self.config[guild_id][nome]
-        
+
+        info = guild_cmds[trigger]
         embed = discord.Embed(
-            title=f"Comando: !{nome}",
+            title=f"!{trigger}",
             description=info["resposta"],
-            color=discord.Color.purple()
+            color=discord.Color.purple(),
         )
-        embed.set_footer(text=f"Criado por {info['criado_por']}")
+        embed.set_footer(text=f"Criado por {info.get('criado_por', 'desconhecido')}")
         await ctx.send(embed=embed)
-    
+
     @commands.Cog.listener()
-    async def on_message(self, message):
-        """Listener para executar comandos personalizados"""
-        if message.author.bot:
+    async def on_message(self, message: discord.Message) -> None:
+        """Intercept prefixed messages that match a guild's custom command table."""
+        if message.author.bot or not message.guild:
             return
-        
-        if not message.guild:
+
+        if not message.content.startswith(Config.COMMAND_PREFIX):
             return
-        
-        guild_id = str(message.guild.id)
-        
-        if guild_id not in self.config:
+
+        tokens = message.content[len(Config.COMMAND_PREFIX) :].split()
+        if not tokens:
             return
-        
-        # Verifica se é comando
-        if not message.content.startswith("!"):
+
+        trigger = tokens[0].lower()
+        guild_cmds = self.store.get(str(message.guild.id), {})
+        entry = guild_cmds.get(trigger)
+        if not entry:
             return
-        
-        # Extrai nome do comando
-        try:
-            cmd_name = message.content[1:].split()[0].lower()
-        except:
-            return
-        
-        if cmd_name not in self.config[guild_id]:
-            return
-        
-        # Pega resposta e envia
-        resposta = self.config[guild_id][cmd_name]["resposta"]
-        
-        # Substitui variáveis simples
-        resposta = resposta.replace("{author}", message.author.mention)
-        resposta = resposta.replace("{guild}", message.guild.name)
-        resposta = resposta.replace("{timestamp}", str(message.created_at))
-        
-        await message.channel.send(resposta)
+
+        rendered = (
+            entry["resposta"]
+            .replace("{author}", message.author.mention)
+            .replace("{guild}", message.guild.name)
+            .replace("{timestamp}", message.created_at.strftime("%d/%m/%Y %H:%M"))
+        )
+        await message.channel.send(rendered)
 
 
-async def setup(bot):
+async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(CustomCom(bot))
