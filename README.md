@@ -25,8 +25,8 @@ Default prefix is `!` (configurable via `COMMAND_PREFIX` in `.env`).
 ## Setup
 
 ```bash
-git clone https://github.com/hizzui/NewDiscordBot.git
-cd NewDiscordBot
+git clone https://github.com/hizzui/Capricorn.git
+cd Capricorn
 pip install -r requirements.txt
 cp .env.example .env
 ```
