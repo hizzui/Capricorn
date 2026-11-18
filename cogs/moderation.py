@@ -1,11 +1,11 @@
 """
-Módulo de Contramedidas ICE, Segurança da Sub-rede e Expurgo de Canal.
-Inclui kick, ban, unban, mute/unmute, sistema de 3 strikes (Soulkiller Auto-Ban) e clear.
+Moderation and channel cleanup cog.
+Includes kick, ban, unban, mute/unmute, 3-strike warning system, and bulk message clear.
 """
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 import discord
@@ -15,7 +15,7 @@ from config import Config, build_embed, load_json, save_json
 
 
 class Moderation(commands.Cog):
-    """Protocolos de segurança ICE, controle disciplinar e limpeza de canais."""
+    """Server moderation and bulk message cleanup commands."""
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
@@ -29,14 +29,14 @@ class Moderation(commands.Cog):
     def _check_hierarchy(ctx: commands.Context, target: discord.Member) -> Optional[discord.Embed]:
         if target.id == ctx.author.id:
             return build_embed(
-                title="⛔ OPERAÇÃO BLOQUEADA // AUTO-ALVO",
-                description="Os protocolos ICE impedem a aplicação desta diretriz em seu próprio registro.",
+                title="Action Denied",
+                description="You cannot perform this moderation action on yourself.",
                 color=Config.COLOR_ERROR,
             )
         if ctx.guild and target.id == ctx.guild.owner_id:
             return build_embed(
-                title="⛔ OPERAÇÃO BLOQUEADA // IMUNIDADE EXECUTIVA",
-                description="Não é possível aplicar contramedidas contra o Diretor Executivo (Owner) da sub-rede.",
+                title="Action Denied",
+                description="You cannot moderate the server owner.",
                 color=Config.COLOR_ERROR,
             )
         if (
@@ -46,8 +46,8 @@ class Moderation(commands.Cog):
             and target.top_role >= ctx.author.top_role
         ):
             return build_embed(
-                title="⛔ HIERARQUIA CORPORATIVA INSUFICIENTE",
-                description="O alvo possui nível de credencial igual ou superior ao seu.",
+                title="Insufficient Role Hierarchy",
+                description="That member has a role equal to or higher than yours.",
                 color=Config.COLOR_ERROR,
             )
         return None
@@ -57,123 +57,98 @@ class Moderation(commands.Cog):
     async def kick(
         self,
         ctx: commands.Context,
-        membro: discord.Member,
+        member: discord.Member,
         *,
-        razao: str = "Sem diretriz especificada",
+        reason: str = "No reason provided",
     ) -> None:
-        """Desconecta forçadamente (expulsa) um membro da sub-rede."""
-        err_embed = self._check_hierarchy(ctx, membro)
-        if err_embed:
-            await ctx.send(embed=err_embed)
+        """Kick a member from the server."""
+        err = self._check_hierarchy(ctx, member)
+        if err:
+            await ctx.send(embed=err)
             return
 
         try:
-            await membro.kick(reason=f"[CAPRICORN ICE] {ctx.author}: {razao}")
+            await member.kick(reason=f"{ctx.author}: {reason}")
             embed = build_embed(
-                title="⚡ DESCONEXÃO FORÇADA // KICK",
-                description=f"O cidadão **{membro}** teve seu vínculo com a sub-rede encerrado.",
+                title="Member Kicked",
+                description=f"**{member}** has been removed from the server.",
                 color=Config.COLOR_WARNING,
-                footer_extra="ICE COUNTERMEASURES",
             )
-            embed.add_field(name="Alvo", value=f"`{membro}` (`{membro.id}`)", inline=True)
-            embed.add_field(name="Agente Executor", value=ctx.author.mention, inline=True)
-            embed.add_field(name="Diretriz / Razão", value=razao, inline=False)
+            embed.add_field(name="Moderator", value=ctx.author.mention, inline=True)
+            embed.add_field(name="Reason", value=reason, inline=True)
             await ctx.send(embed=embed)
         except discord.HTTPException as exc:
-            embed = build_embed(
-                title="❌ FALHA NA CONTRAMEDIDA",
-                description=f"Não foi possível desconectar o alvo: `{exc}`",
-                color=Config.COLOR_ERROR,
-            )
-            await ctx.send(embed=embed)
+            await ctx.send(embed=build_embed("Kick Failed", str(exc), color=Config.COLOR_ERROR))
 
     @commands.command()
     @commands.has_permissions(ban_members=True)
     async def ban(
         self,
         ctx: commands.Context,
-        membro: discord.Member,
+        member: discord.Member,
         *,
-        razao: str = "Sem diretriz especificada",
+        reason: str = "No reason provided",
     ) -> None:
-        """Neutraliza e bane permanentemente um membro da sub-rede."""
-        err_embed = self._check_hierarchy(ctx, membro)
-        if err_embed:
-            await ctx.send(embed=err_embed)
+        """Ban a member from the server."""
+        err = self._check_hierarchy(ctx, member)
+        if err:
+            await ctx.send(embed=err)
             return
 
         try:
-            await membro.ban(
-                reason=f"[CAPRICORN BLACKWALL] {ctx.author}: {razao}",
-                delete_message_seconds=86400,
-            )
+            await member.ban(reason=f"{ctx.author}: {reason}", delete_message_seconds=86400)
             embed = build_embed(
-                title="🩸 NEUTRALIZAÇÃO BLACKWALL // BANIMENTO",
-                description=f"O registro de **{membro}** foi permanentemente bloqueado nesta sub-rede.",
+                title="Member Banned",
+                description=f"**{member}** has been banned from the server.",
                 color=Config.COLOR_ERROR,
-                footer_extra="SOULKILLER PROTOCOL",
             )
-            embed.add_field(name="Alvo Neutralizado", value=f"`{membro}` (`{membro.id}`)", inline=True)
-            embed.add_field(name="Agente Executor", value=ctx.author.mention, inline=True)
-            embed.add_field(name="Diretriz / Razão", value=razao, inline=False)
+            embed.add_field(name="Moderator", value=ctx.author.mention, inline=True)
+            embed.add_field(name="Reason", value=reason, inline=True)
             await ctx.send(embed=embed)
         except discord.HTTPException as exc:
-            embed = build_embed(
-                title="❌ FALHA NA NEUTRALIZAÇÃO",
-                description=f"Erro ao aplicar protocolo de banimento: `{exc}`",
-                color=Config.COLOR_ERROR,
-            )
-            await ctx.send(embed=embed)
+            await ctx.send(embed=build_embed("Ban Failed", str(exc), color=Config.COLOR_ERROR))
 
     @commands.command()
     @commands.has_permissions(ban_members=True)
-    async def unban(self, ctx: commands.Context, *, usuario: str) -> None:
-        """Revoga o bloqueio Blackwall de um usuário pelo nome ou ID."""
-        query = usuario.strip().lower()
+    async def unban(self, ctx: commands.Context, *, user_query: str) -> None:
+        """Unban a user by username or Discord ID."""
+        query = user_query.strip().lower()
         async for entry in ctx.guild.bans():
             if entry.user.name.lower() == query or str(entry.user.id) == query:
                 try:
-                    await ctx.guild.unban(
-                        entry.user,
-                        reason=f"[CAPRICORN ICE] Revogado por {ctx.author}",
-                    )
+                    await ctx.guild.unban(entry.user, reason=f"Unbanned by {ctx.author}")
                     embed = build_embed(
-                        title="🔓 BLOQUEIO ICE REVOGADO // UNBAN",
-                        description=f"O cidadão **{entry.user}** teve suas credenciais de acesso restauradas.",
+                        title="Member Unbanned",
+                        description=f"Ban removed for **{entry.user}**.",
                         color=Config.COLOR_SUCCESS,
-                        footer_extra=f"Autorizado por {ctx.author.display_name}",
                     )
                     await ctx.send(embed=embed)
                     return
                 except discord.HTTPException as exc:
-                    embed = build_embed(
-                        title="❌ FALHA AO REVOGAR BLOQUEIO",
-                        description=f"Erro de comunicação com o gateway: `{exc}`",
-                        color=Config.COLOR_ERROR,
-                    )
-                    await ctx.send(embed=embed)
+                    await ctx.send(embed=build_embed("Unban Failed", str(exc), color=Config.COLOR_ERROR))
                     return
 
-        embed = build_embed(
-            title="🔍 REGISTRO NÃO LOCALIZADO",
-            description=f"O identificador `{usuario}` não consta na lista de neutralizações da Blackwall.",
-            color=Config.COLOR_WARNING,
+        await ctx.send(
+            embed=build_embed(
+                "User Not Found",
+                f"No banned user matching `{user_query}` was found.",
+                color=Config.COLOR_WARNING,
+            )
         )
-        await ctx.send(embed=embed)
 
     @commands.command()
     @commands.has_permissions(manage_roles=True)
     async def mute(
         self,
         ctx: commands.Context,
-        membro: discord.Member,
+        member: discord.Member,
         *,
-        razao: str = "Sem diretriz especificada",
+        reason: str = "No reason provided",
     ) -> None:
-        """Corta a transmissão de texto de um membro na sub-rede."""
-        err_embed = self._check_hierarchy(ctx, membro)
-        if err_embed:
-            await ctx.send(embed=err_embed)
+        """Mute a member in text channels using the configured mute role."""
+        err = self._check_hierarchy(ctx, member)
+        if err:
+            await ctx.send(embed=err)
             return
 
         muted_role = discord.utils.get(ctx.guild.roles, name=Config.MUTE_ROLE_NAME)
@@ -181,123 +156,103 @@ class Moderation(commands.Cog):
             try:
                 muted_role = await ctx.guild.create_role(
                     name=Config.MUTE_ROLE_NAME,
-                    reason="[CAPRICORN ICE] Credencial de restrição de transmissão",
+                    reason="Mute role created by Capricorn",
                 )
                 for channel in ctx.guild.text_channels:
                     await channel.set_permissions(muted_role, send_messages=False)
             except discord.HTTPException as exc:
-                embed = build_embed(
-                    title="❌ FALHA DE PROVISIONAMENTO",
-                    description=f"Não foi possível criar o cargo `{Config.MUTE_ROLE_NAME}`: `{exc}`",
-                    color=Config.COLOR_ERROR,
+                await ctx.send(
+                    embed=build_embed(
+                        "Role Creation Failed",
+                        f"Could not create `{Config.MUTE_ROLE_NAME}` role: {exc}",
+                        color=Config.COLOR_ERROR,
+                    )
                 )
-                await ctx.send(embed=embed)
                 return
 
         try:
-            await membro.add_roles(muted_role, reason=f"[CAPRICORN ICE] {ctx.author}: {razao}")
+            await member.add_roles(muted_role, reason=f"{ctx.author}: {reason}")
             embed = build_embed(
-                title="🔇 TRANSMISSÃO NEURAL BLOQUEADA // MUTE",
-                description=f"Os canais de comunicação de **{membro.display_name}** foram silenciados.",
+                title="Member Muted",
+                description=f"**{member.display_name}** has been muted.",
                 color=Config.COLOR_WARNING,
-                footer_extra="COMM-LINK JAMMER",
             )
-            embed.add_field(name="Alvo", value=membro.mention, inline=True)
-            embed.add_field(name="Agente Executor", value=ctx.author.mention, inline=True)
-            embed.add_field(name="Diretriz / Razão", value=razao, inline=False)
+            embed.add_field(name="Moderator", value=ctx.author.mention, inline=True)
+            embed.add_field(name="Reason", value=reason, inline=True)
             await ctx.send(embed=embed)
         except discord.HTTPException as exc:
-            embed = build_embed(
-                title="❌ ERRO DE BLOQUEIO",
-                description=f"Falha ao silenciar transmissão: `{exc}`",
-                color=Config.COLOR_ERROR,
-            )
-            await ctx.send(embed=embed)
+            await ctx.send(embed=build_embed("Mute Failed", str(exc), color=Config.COLOR_ERROR))
 
     @commands.command()
     @commands.has_permissions(manage_roles=True)
-    async def unmute(self, ctx: commands.Context, membro: discord.Member) -> None:
-        """Restabelece a transmissão de texto de um membro silenciado."""
+    async def unmute(self, ctx: commands.Context, member: discord.Member) -> None:
+        """Remove the mute role from a member."""
         muted_role = discord.utils.get(ctx.guild.roles, name=Config.MUTE_ROLE_NAME)
-        if muted_role is None or muted_role not in membro.roles:
-            embed = build_embed(
-                title="⚠️ OPERAÇÃO REDUNDANTE",
-                description=f"O cidadão **{membro.display_name}** não possui restrição de transmissão ativa.",
-                color=Config.COLOR_WARNING,
+        if muted_role is None or muted_role not in member.roles:
+            await ctx.send(
+                embed=build_embed(
+                    "Not Muted",
+                    f"**{member.display_name}** is not currently muted.",
+                    color=Config.COLOR_WARNING,
+                )
             )
-            await ctx.send(embed=embed)
             return
 
         try:
-            await membro.remove_roles(muted_role, reason=f"[CAPRICORN ICE] Restaurado por {ctx.author}")
+            await member.remove_roles(muted_role, reason=f"Unmuted by {ctx.author}")
             embed = build_embed(
-                title="🔊 TRANSMISSÃO RESTABELECIDA // UNMUTE",
-                description=f"O link de comunicação de **{membro.display_name}** foi reativado com sucesso.",
+                title="Member Unmuted",
+                description=f"**{member.display_name}** has been unmuted.",
                 color=Config.COLOR_SUCCESS,
-                footer_extra=f"Autorizado por {ctx.author.display_name}",
             )
             await ctx.send(embed=embed)
         except discord.HTTPException as exc:
-            embed = build_embed(
-                title="❌ ERRO AO RESTAURAR LINK",
-                description=f"Não foi possível remover o silenciamento: `{exc}`",
-                color=Config.COLOR_ERROR,
-            )
-            await ctx.send(embed=embed)
+            await ctx.send(embed=build_embed("Unmute Failed", str(exc), color=Config.COLOR_ERROR))
 
     @commands.command()
     @commands.has_permissions(manage_messages=True)
     async def warn(
         self,
         ctx: commands.Context,
-        membro: discord.Member,
+        member: discord.Member,
         *,
-        razao: str = "Sem diretriz especificada",
+        reason: str = "No reason provided",
     ) -> None:
-        """Registra uma infração disciplinar; atingir `Config.WARN_LIMIT` aciona o Auto-Ban Soulkiller."""
-        err_embed = self._check_hierarchy(ctx, membro)
-        if err_embed:
-            await ctx.send(embed=err_embed)
+        """Warn a member; reaching `Config.WARN_LIMIT` triggers an automatic ban."""
+        err = self._check_hierarchy(ctx, member)
+        if err:
+            await ctx.send(embed=err)
             return
 
         users = self.state.setdefault("users", {})
-        record = users.setdefault(str(membro.id), {"warns": 0, "motivos": []})
+        record = users.setdefault(str(member.id), {"warns": 0, "motivos": []})
         record["warns"] += 1
         record["motivos"].append(
             {
-                "razao": razao,
+                "razao": reason,
                 "moderador": str(ctx.author),
-                "data": datetime.now().strftime("%d/%m/%Y %H:%M"),
+                "data": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
             }
         )
         self._persist()
 
         count = int(record["warns"])
         embed = build_embed(
-            title="⚠️ INFRAÇÃO CORPORATIVA REGISTRADA // WARN",
-            description=f"Uma advertência disciplinar foi anexada ao dossiê de **{membro.display_name}**.",
+            title="Warning Issued",
+            description=f"**{member.display_name}** received a warning (`{count}/{Config.WARN_LIMIT}`).",
             color=Config.COLOR_WARNING,
-            footer_extra="ARASAKA COMPLIANCE DIVISION",
         )
-        embed.add_field(name="Cidadão", value=membro.mention, inline=True)
-        embed.add_field(name="Nível de Risco", value=f"**`{count} / {Config.WARN_LIMIT}`**", inline=True)
-        embed.add_field(name="Agente Executor", value=ctx.author.mention, inline=True)
-        embed.add_field(name="Diretriz Violada", value=razao, inline=False)
+        embed.add_field(name="Moderator", value=ctx.author.mention, inline=True)
+        embed.add_field(name="Reason", value=reason, inline=True)
         await ctx.send(embed=embed)
 
         if count >= Config.WARN_LIMIT:
             try:
-                await membro.ban(
-                    reason=f"[SOULKILLER AUTO-BAN] Atingiu o limite de {Config.WARN_LIMIT} infrações."
-                )
+                await member.ban(reason=f"Reached {Config.WARN_LIMIT} warnings.")
                 ban_embed = build_embed(
-                    title="🩸 PROTOCOLO SOULKILLER ACIONADO // AUTO-BAN",
-                    description=(
-                        f"**{membro}** atingiu o limite crítico de **`{Config.WARN_LIMIT}/{Config.WARN_LIMIT}`** "
-                        "infrações e foi automaticamente neutralizado da sub-rede."
-                    ),
+                    title="Automatic Ban Triggered",
+                    description=f"**{member}** reached **{Config.WARN_LIMIT}** warnings and was banned.",
                     color=Config.COLOR_ERROR,
-                    footer_extra="AUTOMATED BLACKWALL DEFENSE",
                 )
                 await ctx.send(embed=ban_embed)
             except discord.HTTPException:
@@ -307,91 +262,83 @@ class Moderation(commands.Cog):
     async def warnings(
         self,
         ctx: commands.Context,
-        membro: Optional[discord.Member] = None,
+        member: Optional[discord.Member] = None,
     ) -> None:
-        """Consulta o histórico de infrações registradas para um membro."""
-        target = membro or ctx.author
+        """View warnings recorded for a member."""
+        target = member or ctx.author
         record = self.state.get("users", {}).get(str(target.id))
         if not record or not record.get("warns"):
             embed = build_embed(
-                title="🟢 FICHA DISCIPLINAR LIMPA",
-                description=f"O cidadão **{target.display_name}** não possui infrações registradas na sub-rede.",
+                title="Warnings",
+                description=f"**{target.display_name}** has no recorded warnings.",
                 color=Config.COLOR_SUCCESS,
             )
             await ctx.send(embed=embed)
             return
 
         embed = build_embed(
-            title=f"📋 HISTÓRICO DE INFRAÇÕES // {target.display_name.upper()}",
-            description=f"Nível de risco acumulado: **`{record['warns']} / {Config.WARN_LIMIT}`**",
+            title=f"Warnings — {target.display_name} ({record['warns']}/{Config.WARN_LIMIT})",
             color=Config.COLOR_WARNING,
-            footer_extra="ARASAKA COMPLIANCE RECORDS",
         )
-        embed.set_thumbnail(url=target.display_avatar.url)
         for idx, item in enumerate(record.get("motivos", []), start=1):
-            data_str = item.get("data", "Registro legado")
+            reason_text = item.get("razao") or item.get("reason", "N/A")
+            mod_text = item.get("moderador") or item.get("moderator", "Unknown")
             embed.add_field(
-                name=f"Infração #{idx:02d} • {data_str}",
-                value=f"**Diretriz:** {item['razao']}\n**Executor:** `{item['moderador']}`",
+                name=f"#{idx}",
+                value=f"{reason_text} *(by {mod_text})*",
                 inline=False,
             )
         await ctx.send(embed=embed)
 
     @commands.command()
     @commands.has_permissions(manage_messages=True)
-    async def unwarn(self, ctx: commands.Context, membro: discord.Member) -> None:
-        """Remove a infração mais recente do dossiê de um membro."""
-        record = self.state.get("users", {}).get(str(membro.id))
+    async def unwarn(self, ctx: commands.Context, member: discord.Member) -> None:
+        """Remove the latest warning from a member."""
+        record = self.state.get("users", {}).get(str(member.id))
         if not record or record.get("warns", 0) <= 0:
-            embed = build_embed(
-                title="⚠️ NENHUMA INFRAÇÃO ATIVA",
-                description=f"**{membro.display_name}** não possui registros disciplinares para remoção.",
-                color=Config.COLOR_WARNING,
+            await ctx.send(
+                embed=build_embed(
+                    "No Warnings",
+                    f"**{member.display_name}** has no warnings to remove.",
+                    color=Config.COLOR_WARNING,
+                )
             )
-            await ctx.send(embed=embed)
             return
 
         record["warns"] -= 1
-        removed = record["motivos"].pop() if record.get("motivos") else None
+        if record.get("motivos"):
+            record["motivos"].pop()
         self._persist()
 
         embed = build_embed(
-            title="✅ INFRAÇÃO EXPURGADA // UNWARN",
-            description=f"O registro disciplinar mais recente de **{membro.display_name}** foi removido.",
+            title="Warning Removed",
+            description=f"Removed the latest warning from **{member.display_name}** (`{record['warns']}/{Config.WARN_LIMIT}`).",
             color=Config.COLOR_SUCCESS,
-            footer_extra=f"Autorizado por {ctx.author.display_name}",
         )
-        embed.add_field(
-            name="Nível de Risco Atual",
-            value=f"**`{record['warns']} / {Config.WARN_LIMIT}`**",
-            inline=True,
-        )
-        if removed:
-            embed.add_field(name="Registro Removido", value=removed.get("razao", "N/A"), inline=True)
         await ctx.send(embed=embed)
 
     @commands.command(name="clear", aliases=["purge", "clean"])
     @commands.has_permissions(manage_messages=True)
-    async def clear(self, ctx: commands.Context, quantidade: int = 20) -> None:
-        """Expurga em massa até `quantidade` transmissões recentes do canal (1 a 200)."""
-        if not 1 <= quantidade <= 200:
-            embed = build_embed(
-                title="⚠️ PARÂMETRO DE EXPURGO INVÁLIDO",
-                description="Especifique um volume entre **1** e **200** transmissões para limpeza.",
-                color=Config.COLOR_WARNING,
+    async def clear(self, ctx: commands.Context, count: int = 20) -> None:
+        """Bulk-delete up to `count` recent messages in the channel."""
+        if not 1 <= count <= 200:
+            await ctx.send(
+                embed=build_embed(
+                    "Invalid Amount",
+                    "Please specify a number of messages between **1** and **200**.",
+                    color=Config.COLOR_WARNING,
+                )
             )
-            await ctx.send(embed=embed)
             return
 
-        deleted = await ctx.channel.purge(limit=quantidade + 1)
+        deleted = await ctx.channel.purge(limit=count + 1)
         removed_count = max(0, len(deleted) - 1)
         embed = build_embed(
-            title="🧹 EXPURGO DE DADOS CONCLUÍDO",
-            description=f"**`{removed_count}`** transmissões foram permanentemente removidas deste canal.",
+            title="Channel Purged",
+            description=f"Deleted **{removed_count}** messages.",
             color=Config.COLOR_SUCCESS,
-            footer_extra=f"Executado por {ctx.author.display_name}",
         )
-        await ctx.send(embed=embed, delete_after=4.5)
+        await ctx.send(embed=embed, delete_after=4.0)
 
 
 async def setup(bot: commands.Bot) -> None:

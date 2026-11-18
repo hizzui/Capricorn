@@ -1,6 +1,5 @@
 """
-Módulo Econômico Corporativo (`!balance`, `!payday`, `!pay`, `!slots`, `!leaderboard`).
-Moeda: Eurodólares (€$) — Project Capricorn // Arasaka Financial Terminal.
+Virtual economy cog (`!balance`, `!payday`, `!pay`, `!slots`, `!leaderboard`).
 """
 
 from __future__ import annotations
@@ -12,13 +11,13 @@ from typing import Any, Dict, Optional
 import discord
 from discord.ext import commands
 
-from config import Config, build_embed, format_currency, load_json, save_json
+from config import Config, build_embed, load_json, save_json
 
-SLOT_SYMBOLS = ("🩸", "⚡", "💠", "🎰", "👑", "7️⃣")
+SLOT_SYMBOLS = ("🍒", "🍀", "💎", "🎰", "👑", "7️⃣")
 
 
 class Economy(commands.Cog):
-    """Gerenciamento de contas em Eurodólares (€$), transferências neurais e terminal de apostas."""
+    """Virtual currency balances, transfers, daily rewards, and slot machine."""
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
@@ -43,34 +42,25 @@ class Economy(commands.Cog):
         self.state.setdefault("users", {})[str(user_id)] = max(0, int(amount))
         self._persist()
 
-    @commands.command()
+    @commands.command(name="balance", aliases=["bal"])
     async def balance(
         self,
         ctx: commands.Context,
-        usuario: Optional[discord.User] = None,
+        user: Optional[discord.User] = None,
     ) -> None:
-        """Consulta o saldo em Eurodólares (€$) de uma conta corporativa."""
-        target = usuario or ctx.author
-        saldo = self.get_balance(target.id)
-
+        """Check your credit balance or another user's balance."""
+        target = user or ctx.author
+        bal = self.get_balance(target.id)
         embed = build_embed(
-            title="💶 TERMINAL FINANCEIRO // EXTRATO DE CONTA",
-            description=f"Consulta de ativos registrada para **{target.display_name}**.",
-            color=Config.COLOR_GOLD,
-            footer_extra="ARASAKA BANKING CORP",
+            title="Account Balance",
+            description=f"**{target.display_name}** has **{bal:,}** credits.",
+            color=Config.COLOR_PRIMARY,
         )
-        embed.set_thumbnail(url=target.display_avatar.url)
-        embed.add_field(
-            name=f"Saldo Disponível ({Config.CURRENCY_NAME})",
-            value=f"**`{format_currency(saldo)}`**",
-            inline=True,
-        )
-        embed.add_field(name="Status da Conta", value="`🟢 Verificada`", inline=True)
         await ctx.send(embed=embed)
 
-    @commands.command()
+    @commands.command(name="payday", aliases=["daily"])
     async def payday(self, ctx: commands.Context) -> None:
-        """Resgata o subsídio diário corporativo em Eurodólares (ciclo de 24h)."""
+        """Claim daily credits (24h cooldown)."""
         user_key = str(ctx.author.id)
         claims = self.state.setdefault("last_payday", {})
         now = datetime.now()
@@ -84,49 +74,34 @@ class Economy(commands.Cog):
                     h = int(rem.total_seconds() // 3600)
                     m = int((rem.total_seconds() % 3600) // 60)
                     embed = build_embed(
-                        title="⏳ SUBSÍDIO EM BLOQUEIO TEMPORÁRIO",
-                        description=(
-                            "Sua cota diária de Eurodólares já foi processada neste ciclo.\n"
-                            f"Próxima liberação autorizada em: **`{h}h {m}m`**."
-                        ),
+                        title="Cooldown Active",
+                        description=f"You have already claimed your daily reward. Try again in **{h}h {m}m**.",
                         color=Config.COLOR_WARNING,
-                        footer_extra="ARASAKA PAYROLL SYSTEM",
                     )
                     await ctx.send(embed=embed)
                     return
             except ValueError:
                 pass
 
-        novo_saldo = self.get_balance(ctx.author.id) + Config.PAYDAY_AMOUNT
-        self.state["users"][user_key] = novo_saldo
+        new_balance = self.get_balance(ctx.author.id) + Config.PAYDAY_AMOUNT
+        self.state["users"][user_key] = new_balance
         claims[user_key] = now.isoformat()
         self._persist()
 
         embed = build_embed(
-            title="💶 SUBSÍDIO CORPORATIVO LIBERADO",
-            description=f"Transferência diária creditada na conta de **{ctx.author.display_name}**.",
+            title="Daily Reward Claimed",
+            description=f"You received **+{Config.PAYDAY_AMOUNT:,}** credits.\nNew balance: **{new_balance:,}** credits.",
             color=Config.COLOR_SUCCESS,
-            footer_extra="ARASAKA PAYROLL SYSTEM",
-        )
-        embed.add_field(
-            name="Valor Creditado",
-            value=f"**`+{format_currency(Config.PAYDAY_AMOUNT)}`**",
-            inline=True,
-        )
-        embed.add_field(
-            name="Saldo Atualizado",
-            value=f"**`{format_currency(novo_saldo)}`**",
-            inline=True,
         )
         await ctx.send(embed=embed)
 
     @commands.command()
-    async def pay(self, ctx: commands.Context, usuario: discord.User, amount: int) -> None:
-        """Realiza uma transferência neural de Eurodólares para outro cidadão."""
-        if usuario.id == ctx.author.id or usuario.bot:
+    async def pay(self, ctx: commands.Context, user: discord.User, amount: int) -> None:
+        """Transfer credits to another user."""
+        if user.id == ctx.author.id or user.bot:
             embed = build_embed(
-                title="❌ TRANSAÇÃO RECUSADA // DESTINATÁRIO INVÁLIDO",
-                description="Não é possível transferir fundos para si mesmo ou para construtos automatizados.",
+                title="Invalid Recipient",
+                description="You cannot transfer credits to yourself or to a bot.",
                 color=Config.COLOR_ERROR,
             )
             await ctx.send(embed=embed)
@@ -134,66 +109,50 @@ class Economy(commands.Cog):
 
         if amount <= 0:
             embed = build_embed(
-                title="❌ TRANSAÇÃO RECUSADA // VALOR INVÁLIDO",
-                description="O montante da transferência deve ser estritamente maior que zero.",
+                title="Invalid Amount",
+                description="Transfer amount must be greater than zero.",
                 color=Config.COLOR_ERROR,
             )
             await ctx.send(embed=embed)
             return
 
-        saldo = self.get_balance(ctx.author.id)
-        if saldo < amount:
+        bal = self.get_balance(ctx.author.id)
+        if bal < amount:
             embed = build_embed(
-                title="❌ FUNDOS INSUFICIENTES",
-                description=(
-                    f"Seu saldo disponível (**`{format_currency(saldo)}`**) é inferior "
-                    f"ao valor solicitado (**`{format_currency(amount)}`**)."
-                ),
+                title="Insufficient Funds",
+                description=f"Your current balance (**{bal:,}** credits) is lower than **{amount:,}**.",
                 color=Config.COLOR_ERROR,
             )
             await ctx.send(embed=embed)
             return
 
-        novo_saldo_remetente = saldo - amount
-        novo_saldo_destinatario = self.get_balance(usuario.id) + amount
-        self.set_balance(ctx.author.id, novo_saldo_remetente)
-        self.set_balance(usuario.id, novo_saldo_destinatario)
+        self.set_balance(ctx.author.id, bal - amount)
+        self.set_balance(user.id, self.get_balance(user.id) + amount)
 
         embed = build_embed(
-            title="⚡ TRANSFERÊNCIA NEURAL CONCLUÍDA",
-            description="Operação P2P autenticada pela rede financeira de Night City.",
+            title="Transfer Complete",
+            description=f"**{ctx.author.display_name}** transferred **{amount:,}** credits to **{user.display_name}**.",
             color=Config.COLOR_SUCCESS,
-            footer_extra="P2P ENCRYPTED LEDGER",
-        )
-        embed.add_field(name="Remetente", value=ctx.author.mention, inline=True)
-        embed.add_field(name="Destinatário", value=usuario.mention, inline=True)
-        embed.add_field(
-            name="Valor Transferido",
-            value=f"**`{format_currency(amount)}`**",
-            inline=True,
         )
         await ctx.send(embed=embed)
 
     @commands.command()
-    async def slots(self, ctx: commands.Context, aposta: int = Config.SLOTS_MIN_BET) -> None:
-        """Aposta Eurodólares no terminal de caça-níqueis de Night City."""
-        if not Config.SLOTS_MIN_BET <= aposta <= Config.SLOTS_MAX_BET:
+    async def slots(self, ctx: commands.Context, bet: int = Config.SLOTS_MIN_BET) -> None:
+        """Bet credits on a 3-reel slot machine."""
+        if not Config.SLOTS_MIN_BET <= bet <= Config.SLOTS_MAX_BET:
             embed = build_embed(
-                title="⚠️ LIMITE DE APOSTA VIOLADO",
-                description=(
-                    f"O terminal aceita apostas entre **`{format_currency(Config.SLOTS_MIN_BET)}`** "
-                    f"e **`{format_currency(Config.SLOTS_MAX_BET)}`**."
-                ),
+                title="Invalid Bet",
+                description=f"Bet amount must be between **{Config.SLOTS_MIN_BET:,}** and **{Config.SLOTS_MAX_BET:,}** credits.",
                 color=Config.COLOR_WARNING,
             )
             await ctx.send(embed=embed)
             return
 
-        saldo = self.get_balance(ctx.author.id)
-        if saldo < aposta:
+        bal = self.get_balance(ctx.author.id)
+        if bal < bet:
             embed = build_embed(
-                title="❌ FUNDOS INSUFICIENTES",
-                description=f"Saldo atual (**`{format_currency(saldo)}`**) insuficiente para cobrir a aposta.",
+                title="Insufficient Funds",
+                description=f"Your current balance (**{bal:,}** credits) cannot cover this bet.",
                 color=Config.COLOR_ERROR,
             )
             await ctx.send(embed=embed)
@@ -201,67 +160,52 @@ class Economy(commands.Cog):
 
         r1, r2, r3 = random.choices(SLOT_SYMBOLS, k=3)
         if r1 == r2 == r3:
-            delta = aposta * 15
-            status = "🔥 OVERCLOCK JACKPOT (15x)"
+            delta = bet * 15
+            status = "JACKPOT (15x)"
             color = Config.COLOR_GOLD
         elif r1 == r2 or r2 == r3 or r1 == r3:
-            delta = aposta * 2
-            status = "⚡ SINCRONIA PARCIAL (2x)"
+            delta = bet * 2
+            status = "Pair Match (2x)"
             color = Config.COLOR_SUCCESS
         else:
-            delta = -aposta
-            status = "💀 FALHA DE SINCRONIA (Perda)"
+            delta = -bet
+            status = "No Match"
             color = Config.COLOR_ERROR
 
-        novo_saldo = saldo + delta
-        self.set_balance(ctx.author.id, novo_saldo)
-        sinal = "+" if delta >= 0 else "-"
+        new_balance = bal + delta
+        self.set_balance(ctx.author.id, new_balance)
 
         embed = build_embed(
-            title="🎰 NIGHT CITY CASINO // TERMINAL CAPRICORN",
-            description=f"### `[  {r1}  |  {r2}  |  {r3}  ]`\n**Resultado:** {status}",
+            title="Slots",
+            description=f"`[ {r1} | {r2} | {r3} ]` — **{status}** ({delta:+,} credits)\nBalance: **{new_balance:,}** credits",
             color=color,
-            footer_extra=f"Operador: {ctx.author.display_name}",
-        )
-        embed.add_field(
-            name="Balanço da Rodada",
-            value=f"**`{sinal}{format_currency(abs(delta))}`**",
-            inline=True,
-        )
-        embed.add_field(
-            name="Saldo Final",
-            value=f"**`{format_currency(novo_saldo)}`**",
-            inline=True,
         )
         await ctx.send(embed=embed)
 
-    @commands.command()
+    @commands.command(name="leaderboard", aliases=["top", "rich"])
     async def leaderboard(self, ctx: commands.Context) -> None:
-        """Exibe a elite corporativa (Top 10 maiores saldos em Eurodólares)."""
+        """Show the top 10 users by credit balance."""
         users = self.state.get("users", {})
         if not users:
             embed = build_embed(
-                title="📊 RANKING CORPORATIVO // VAZIO",
-                description="Nenhum registro financeiro encontrado no banco de dados da sub-rede.",
-                color=Config.COLOR_WARNING,
+                title="Leaderboard",
+                description="No balances recorded yet.",
+                color=Config.COLOR_PRIMARY,
             )
             await ctx.send(embed=embed)
             return
 
         ranked = sorted(users.items(), key=lambda x: int(x[1]), reverse=True)[:10]
-        badges = {1: "🥇", 2: "🥈", 3: "🥉"}
         lines = []
         for idx, (uid, val) in enumerate(ranked, start=1):
             user_obj = self.bot.get_user(int(uid))
-            name = user_obj.display_name if user_obj else f"Cidadão #{uid}"
-            prefix = badges.get(idx, f"`#{idx:02d}`")
-            lines.append(f"{prefix} **{name}** — `{format_currency(int(val))}`")
+            name = user_obj.display_name if user_obj else f"User #{uid}"
+            lines.append(f"**{idx}.** {name} — `{int(val):,}` credits")
 
         embed = build_embed(
-            title="🏆 ELITE CORPORATIVA // TOP 10 NIGHT CITY",
+            title="Top 10 — Economy Leaderboard",
             description="\n".join(lines),
             color=Config.COLOR_GOLD,
-            footer_extra="ARASAKA WEALTH INDEX",
         )
         await ctx.send(embed=embed)
 
